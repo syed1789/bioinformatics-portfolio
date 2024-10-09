@@ -1,19 +1,24 @@
-File: docs/quality_control.md
-Sequencing Quality Control
+# Sequencing Quality Control
+
 This module provides functionality for performing quality control on sequencing data.
-Overview
+
+## Overview
+
 The quality control process includes:
+1. Calculating various QC metrics
+2. Visualizing the distribution of read qualities
 
-Calculating various QC metrics
-Visualizing the distribution of read qualities
+## Main Functions
 
-Main Functions
+- `calculate_qc_metrics(sequencing_data)`: Calculates quality control metrics for sequencing data.
+- `plot_quality_distribution(sequencing_data)`: Plots the distribution of read qualities.
 
-calculate_qc_metrics(sequencing_data): Calculates quality control metrics for sequencing data.
-plot_quality_distribution(sequencing_data): Plots the distribution of read qualities.
+## Usage
 
-Usage
-pythonCopyfrom src.quality_control.quality_control import main
+```python
+from src.quality_control.quality_control import main
 
 main('path/to/your/sequencing_data.csv')
+```
+
 This will calculate QC metrics and generate a plot of the quality score distribution.
