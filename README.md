@@ -24,6 +24,21 @@ This repository showcases a comprehensive set of bioinformatics analyses and ski
 
 Each analysis can be run independently. See individual documentation in the `docs/` directory for details.
 
+## Documentation
+
+Detailed documentation for each analysis can be found in the `docs` directory:
+
+- [Variant Analysis](docs/variant_analysis.md)
+- [Sequencing Quality Control](docs/quality_control.md)
+- [Genomic Data Preparation](docs/data_preparation.md)
+- [Single-cell RNA-seq Analysis (Seurat)](docs/scrna_seurat.md)
+- [Single-cell RNA-seq Analysis (Scanpy)](docs/scrna_scanpy.md)
+- [Spatial Transcriptomics Analysis](docs/spatial_transcriptomics.md)
+- [Single-cell ATAC-seq Analysis (Signac)](docs/scatac_signac.md)
+- [Single-cell ATAC-seq Analysis (Scanpy)](docs/scatac_scanpy.md)
+
+
 ## Contact
 
 Syed Nurul Hasan - [nayanchoto1789@gmail.com]
+
