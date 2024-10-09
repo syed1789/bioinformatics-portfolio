@@ -3,6 +3,7 @@
 This module provides functionality for analyzing genetic variants from VCF files.
 
 #Overview
+
 The variant analysis pipeline includes the following steps:
 
 Loading VCF files
@@ -19,7 +20,8 @@ Filtering variants based on specific criteria (e.g., minor allele frequency)
 ```python
 from src.variant_analysis.variant_analysis import main
 
-main("path/to/your/vcf/file")```
+main("path/to/your/vcf/file")
+```
 
 
 This will process the VCF file, annotate variants, apply filtering, and output the results.
