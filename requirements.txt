@@ -7,3 +7,6 @@ matplotlib
 seaborn
 rpy2
 pytest
+squidpy
+anndata
+scikit-learn
