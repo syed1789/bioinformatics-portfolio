@@ -26,3 +26,21 @@ pip-delete-this-directory.txt
 .Rhistory
 .RData
 .Ruserdata
+
+# ---- Data: never commit (GSE120575 TPM is 121 MB; GitHub hard limit 100 MB) ----
+data/
+*.gz
+*.txt.gz
+*.rds
+*.RDS
+*.h5
+*.h5ad
+*.loom
+
+# ---- knitr/rmarkdown ----
+*_cache/
+*.knit.md
+*.utf8.md
+
+# ---- macOS ----
+.DS_Store

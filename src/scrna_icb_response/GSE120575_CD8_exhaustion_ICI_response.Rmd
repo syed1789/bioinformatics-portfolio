@@ -1,0 +1,617 @@
+---
+title: "Baseline CD8 Exhaustion Burden Predicts Checkpoint-Blockade Response"
+subtitle: "An end-to-end single-cell reanalysis of GSE120575 (Sade-Feldman et al., Cell 2018)"
+author: "Syed Nurul Hasan, Ph.D."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 5, eval = FALSE)
+set.seed(1789)
+```
+
+# Summary
+
+**Question.** Can the pre-treatment CD8 T-cell compartment predict response to immune
+checkpoint blockade (ICB)?
+
+**Result.** Non-responders carry a significantly higher fraction of exhausted CD8
+T cells at baseline (median **62.4%** vs **50.0%**; mean 60.6% vs 44.4%).
+
+| Operationalization | Statistic | p | AUROC |
+|---|---|---|---|
+| Module-score ratio (memory-like − exhausted) | Wilcoxon W=11 | **0.0041** | 0.878 |
+| CLR-composition, exhausted fraction | Wilcoxon W=79 | **0.0041** (Bonf. 0.017) | 0.878 |
+| Raw exhausted fraction | Wilcoxon W=77 | **0.0076** | **0.856** |
+
+Three independent parameterizations converge on **AUROC ≈ 0.85–0.88** (n = 19
+baseline patients; 10 non-responders / 9 responders).
+
+**Key refinement over the naive analysis.** The signal is **reduced exhaustion**,
+not **expanded memory-like cells**. The memory-like compartment differs at the
+*program* level (module score p = 0.022) but **not** in *absolute abundance*
+(composition p = 0.50). Averaging a memory-like module across all CD8s is
+mechanically lifted by a lower exhausted burden; the cluster-composition test
+dissociates the two and shows exhaustion carries the signal.
+
+**Two analytical decisions that changed the answer** (Sections 4 and 5):
+
+1. Automated reference annotation (SingleR/Monaco) **under-called exhausted CD8s**,
+   assigning ~2,900 of them to a generic `T cells` bucket. Gating on the SingleR
+   label alone would have discarded the arm of the contrast doing the work.
+2. A ~1,270-cell **γδ T-cell** cluster was mislabeled as NK + generic T. γδ cells
+   share cytotoxic markers (NKG7/GNLY/KLRD1) with CD8s and would have contaminated
+   the CD8 pool under a cytotoxicity-based gate.
+
+---
+
+# Data and design
+
+**GSE120575** — Sade-Feldman et al., *Cell* 2018. CD45+ tumor-infiltrating immune
+cells from melanoma biopsies taken before or after anti-CTLA4 / anti-PD1 /
+combination therapy. **Smart-seq2** (plate-based, full-length, one cell per well).
+
+- **55,737 genes × 16,291 cells** after load.
+- **Baseline (Pre): 19 patients — 10 non-responders, 9 responders.**
+- Post-treatment: 29 samples (21 NR / 8 R) — **not used** (see Limitations).
+
+**Design decisions, fixed a priori:**
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Endpoint | Provided Responder / Non-responder | Deposit-level label. Durable clinical benefit (PFS/OS) would be preferable. |
+| Timepoint | **Baseline (Pre) only** | A *predictive* biomarker must exist before dosing. On-treatment data informs mechanism, not enrollment. |
+| Unit of analysis | **Patient (n=19)**, never cell | Cells within a patient are pseudoreplicates. |
+| Intended use | Trial enrichment | Endgame is a small, locked, deployable signature. |
+
+**Tissue caveat.** These are tumor-infiltrating cells, not PBMC. A deployable
+enrichment biomarker would need to be blood-based; tumor is used here because the
+response signal is strong and the labels are clean.
+
+---
+
+# Load
+
+Two GEO quirks required handling.
+
+**(1) The TPM matrix has a two-row header with a one-column offset.** Row 1 = cell
+names (first field blank), row 2 = `Pre_P#`/`Post_P#` sample labels, row 3+ = gene
+symbol in column 1 then TPM values. The file has 16,292 columns = 1 gene column +
+16,291 cells.
+
+**(2) `data.table::fread` fails** on this file — 16,291 columns overflows R's
+`2^31-1` byte character-string limit during parsing. `readr` streams incrementally
+and works, but its default 128 KB connection buffer is smaller than a single line.
+
+```{r load-expr}
+Sys.setenv(VROOM_CONNECTION_SIZE = 500000)   # MUST precede any readr call
+
+library(readr); library(Matrix); library(Seurat); library(dplyr); library(tidyr)
+
+f_tpm  <- "GSE120575_Sade_Feldman_melanoma_single_cells_TPM_GEO.txt.gz"
+f_meta <- "GSE120575_patient_ID_single_cells.txt.gz"
+
+## Row 1 = cell names, offset by one blank leading field
+hdr <- read_lines(f_tpm, n_max = 2)
+cell_names <- strsplit(hdr[1], "\t")[[1]]
+cell_names <- cell_names[cell_names != "" & !is.na(cell_names)]
+stopifnot(length(cell_names) == 16291)
+
+## Rows 3+ : gene symbol in col 1, TPM thereafter
+dat   <- read_tsv(f_tpm, skip = 2, col_names = FALSE, show_col_types = FALSE)
+genes <- dat[[1]]
+expr  <- as.matrix(dat[, -1]); mode(expr) <- "numeric"
+if (ncol(expr) == length(cell_names) + 1) expr <- expr[, -ncol(expr)]  # trailing NA col
+
+rownames(expr) <- make.unique(as.character(genes))
+colnames(expr) <- cell_names
+expr <- Matrix(expr, sparse = TRUE)
+cat("expr:", nrow(expr), "genes x", ncol(expr), "cells\n")   # 55737 x 16291
+```
+
+**(3) The metadata file is a GEO submission template.** A 19-line preamble precedes
+the real table (header on line 20). The submitter misspelled "patient" as
+**`patinet`** in the column name — matching only the correct spelling silently
+returns `NA`. There are also 24 blank rows and a stray `type` row.
+
+```{r load-meta}
+library(data.table)
+meta_raw <- fread(f_meta, skip = "Sample name", header = TRUE, sep = "\t",
+                  data.table = FALSE, fill = TRUE)
+
+col_title    <- grep("^title$",         colnames(meta_raw), value = TRUE)[1]
+col_patient  <- grep("patient|patinet", colnames(meta_raw), ignore.case = TRUE, value = TRUE)[1]
+col_response <- grep("response",        colnames(meta_raw), ignore.case = TRUE, value = TRUE)[1]
+col_therapy  <- grep("therapy",         colnames(meta_raw), ignore.case = TRUE, value = TRUE)[1]
+
+meta <- data.frame(
+  cell     = meta_raw[[col_title]],
+  pt_field = meta_raw[[col_patient]],     # "Pre_P1" / "Post_P28_2"
+  response = meta_raw[[col_response]],    # "Responder" / "Non-responder" (exact strings)
+  therapy  = meta_raw[[col_therapy]],
+  stringsAsFactors = FALSE
+)
+
+## Strip template junk: 24 blank rows + stray 'type' row
+meta <- meta[!is.na(meta$cell) & meta$cell != "" & meta$cell != "type", ]
+meta <- meta[!duplicated(meta$cell), ]
+meta$timepoint <- ifelse(grepl("^Pre",  meta$pt_field), "Pre",
+                  ifelse(grepl("^Post", meta$pt_field), "Post", NA))
+meta$patient   <- sub("^(Pre|Post)_", "", meta$pt_field)
+meta <- meta[meta$response %in% c("Responder","Non-responder") &
+             meta$timepoint %in% c("Pre","Post"), ]
+rownames(meta) <- meta$cell
+stopifnot(nrow(meta) == 16291)           # exact match to the expression matrix
+```
+
+```{r build-obj}
+common <- intersect(colnames(expr), rownames(meta))
+expr <- expr[, common]; meta <- meta[common, ]
+
+obj <- CreateSeuratObject(counts = expr, meta.data = meta, project = "GSE120575")
+## NOTE: the 'counts' slot holds TPM, not raw integer counts.
+##       => differential expression uses limma on log-TPM, NOT DESeq2/edgeR.
+
+pt_tab <- unique(obj@meta.data[, c("patient","timepoint","response")])
+print(table(pt_tab$timepoint, pt_tab$response))
+#         Non-responder Responder
+#   Post             21         8
+#   Pre              10         9
+```
+
+---
+
+# QC, normalization, integration
+
+**Platform-matched QC.** Smart-seq2 sorts one cell per well, so there is **no
+ambient-RNA "soup"** and doublets are rare. `SoupX`/`CellBender` and aggressive
+doublet calling are droplet (10x) tools and are deliberately **not** run here.
+
+Observed distributions confirm high-quality, FACS-sorted input:
+
+- `nFeature_RNA`: bulk 1,500–5,000 (tail to ~9,000) — the deep coverage expected
+  of full-length plate-based protocols.
+- `percent.mt`: **maximum ~4%** — dying cells were largely excluded at the bench.
+  The `< 20` cutoff is far more lenient than the data requires and removes nothing;
+  it is retained for convention.
+
+```{r qc}
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+VlnPlot(obj, c("nFeature_RNA","nCount_RNA","percent.mt"), pt.size = 0)
+
+## Confound check BEFORE trusting anything: is batch collinear with response?
+print(table(obj$patient, obj$response))
+
+obj <- subset(obj, subset = nFeature_RNA > 500 & nFeature_RNA < 9000 & percent.mt < 20)
+
+obj <- NormalizeData(obj) |>
+       FindVariableFeatures(nfeatures = 2000) |>
+       ScaleData() |>
+       RunPCA(npcs = 30)
+
+library(harmony)
+obj <- RunHarmony(obj, group.by.vars = "patient")
+obj <- RunUMAP(obj, reduction = "harmony", dims = 1:30)
+obj <- FindNeighbors(obj, reduction = "harmony", dims = 1:30)
+obj <- FindClusters(obj, resolution = 0.6)
+
+DimPlot(obj, group.by = "response")
+```
+
+### Reading the response UMAP
+
+Responders and non-responders are **thoroughly intermixed across every cluster**.
+This is the expected and desired result, not a null finding:
+
+- Response is **not** a global transcriptomic shift. Clean separation of R vs NR on
+  a UMAP would be *suspicious* — typically a batch confound driving the split.
+- The intermixing confirms **Harmony integrated correctly**: groups are not
+  separated by patient/batch artifact.
+- The signal lives in **proportions and states of specific subsets**, which a
+  whole-population embedding cannot display. This is precisely why the analysis
+  must be differential-abundance and cell-state-resolved rather than bulk.
+
+---
+
+# Annotation: where automated labels fail
+
+```{r singler}
+library(SingleR); library(celldex)
+ref  <- celldex::MonacoImmuneData()
+sce  <- as.SingleCellExperiment(obj)
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+obj$SingleR.main <- pred$labels
+print(table(obj$SingleR.main))
+```
+
+```
+        B cells       Basophils    CD4+ T cells    CD8+ T cells Dendritic cells
+           1777               6            3241            4022             588
+      Monocytes     Neutrophils        NK cells     Progenitors         T cells
+           1154               8             546               3            4945
+```
+
+## Problem 1 — 4,945 cells in a generic `T cells` bucket
+
+Cross-tabulating SingleR labels against Harmony clusters shows the ambiguous bucket
+is **concentrated exactly where CD8s live**:
+
+| Cluster | CD8+ T | generic `T cells` | CD4+ T |
+|---|---|---|---|
+| 1 | 1,667 | **1,504** | 20 |
+| 2 | 564 | **730** | 14 |
+| 6 | 429 | **453** | 9 |
+
+In each, the generic bucket roughly *equals* the confident CD8 calls, with CD4
+essentially absent. These are CD8s that **downregulated canonical markers — the
+exhaustion signature itself**. Gating on `SingleR.main == "CD8+ T cells"` would
+have discarded ~2,900 CD8s, disproportionately the exhausted ones, biasing the
+analysis against the very contrast being tested.
+
+## Problem 2 — a γδ T-cell cluster mislabeled as NK
+
+```{r markers}
+mk <- c("CD3D","CD3E","CD2", "CD8A","CD8B", "CD4","IL7R","FOXP3","CTLA4",
+        "NCAM1","KLRD1","NKG7","GNLY","FCGR3A", "TRDC","TRGC1",
+        "TCF7","SELL","LEF1", "HAVCR2","LAG3","PDCD1","TOX","ENTPD1")
+avg <- AverageExpression(obj, features = mk, group.by = "seurat_clusters",
+                         assays = "RNA", layer = "data")$RNA
+print(round(as.matrix(avg), 2))
+DotPlot(obj, features = mk, group.by = "seurat_clusters") + RotatedAxis()
+```
+
+**Cluster 4** (~1,270 cells): `TRDC` **6.77**, `TRGC1` 2.77, `CD3D` 4.15, `CD3E` 3.47
+— but `CD8A` 0.64, `CD8B` 0.15, `CD4` 0.08. Unambiguously T lineage, negative for
+both co-receptors, with a dominant **γδ TCR constant-chain signal**.
+
+SingleR split these across "NK cells" (302) and generic "T cells" (948) because
+`label.main` has no γδ category. Genuine NK would be **CD3D-negative** (here 4.15);
+`NCAM1` is only 0.52. There is **no clean NK cluster in this dataset** — the "NK"
+calls were largely misassigned γδ T cells. Because γδ cells share NKG7/GNLY/KLRD1
+with CD8s, a cytotoxicity-based gate would have swept them into the CD8 pool.
+
+**Cluster 3** shows `CD4` 2.78 but `CD3D` 0.31 and `FCGR3A` 2.85 — **monocytes
+express CD4**. Gating CD4 T cells on CD4 alone would import the myeloid
+compartment. Hence: **pan-T gate (`CD3D`/`CD3E`) first, co-receptor second.**
+
+## Marker-validated lineage assignment
+
+```{r gate}
+## CD3D+ / CD8A+ / CD8B+ / CD4-low
+cd8_core <- c("1","2","6","8")
+cd8 <- subset(obj, subset = seurat_clusters %in% cd8_core)
+
+## Recover genuine CD8s from mixed clusters (7,9,11: CD8A 3.4-4.0 but CD4 1.5-1.7,
+## FOXP3 present) by per-cell gating rather than majority vote
+mixed <- subset(obj, subset = seurat_clusters %in% c("7","9","11"))
+cd8_cells_mixed <- WhichCells(mixed, expression = CD8A > 1 & CD4 < 0.5 & CD3D > 1)
+cd8 <- merge(cd8, subset(mixed, cells = cd8_cells_mixed))
+
+## Document γδ explicitly rather than silently dropping them
+obj$lineage <- dplyr::case_when(
+  obj$seurat_clusters == "4"                              ~ "gdT",
+  obj$seurat_clusters %in% cd8_core                       ~ "CD8T",
+  obj$seurat_clusters %in% c("0","10")                    ~ "CD4T",
+  obj$seurat_clusters %in% c("3","12")                    ~ "Myeloid",
+  obj$seurat_clusters %in% c("5","13","14","15","16","17")~ "B",
+  TRUE                                                    ~ "Mixed_T"
+)
+print(table(obj$lineage))
+#       B    CD4T    CD8T     gdT Mixed_T Myeloid
+#    1875    3577    6297    1272    1491    1778
+cat("CD8 cells gated:", ncol(cd8), "\n")   # 6936  (vs SingleR's 4022)
+```
+
+## CD8 state definitions
+
+The memory/exhaustion axis is directly readable from the marker table:
+
+| Cluster | TCF7 | IL7R | PDCD1 | HAVCR2 | TOX | LAG3 | Assignment |
+|---|---|---|---|---|---|---|---|
+| **2** | 1.63 | 2.77 | 1.34 | 1.13 | 1.04 | 1.49 | **memory-like** |
+| **1** | 0.84 | 1.06 | **3.15** | **2.96** | **1.99** | 1.94 | **exhausted** |
+| **6** | 1.03 | 1.48 | **2.55** | 2.39 | 1.76 | 1.88 | **exhausted** |
+| 8 | — | — | — | — | — | — | intermediate |
+
+---
+
+# Baseline subset and the metadata inconsistency
+
+Two patients (**P4**, **P28**) carry **opposite response labels at Pre vs Post
+under identical therapy** (`anti-CTLA4+PD1`):
+
+| patient | sample | timepoint | therapy | response |
+|---|---|---|---|---|
+| P28 | Post_P28 | Post | anti-CTLA4+PD1 | Non-responder |
+| P28 | Pre_P28 | Pre | anti-CTLA4+PD1 | **Responder** |
+| P4 | Post_P4 | Post | anti-CTLA4+PD1 | Responder |
+| P4 | Pre_P4 | Pre | anti-CTLA4+PD1 | **Non-responder** |
+
+Response cannot flip for one patient on one therapy course. The most likely reading
+is that **patient IDs are not reliably stable across timepoints in this deposit**,
+or that lesion-level labels were attached inconsistently at submission (P28 also has
+both `Post_P28` and `Post_P28_2`; multi-lesion sampling is in play). This is not
+resolvable from the metadata alone and is reported as an unresolved caveat.
+
+**Consequence — and why the a priori baseline-only design protects us:** every `_2`
+suffixed sample is **Post**; there are no `_2` samples in the Pre set. All 19
+baseline samples carry exactly one response label. The inconsistency threatens only
+*paired* Pre→Post analyses, which are therefore **not attempted**.
+
+```{r baseline}
+cd8_base <- subset(cd8, subset = timepoint == "Pre")
+cd8_base$patient <- sub("^Pre_", "", cd8_base$pt_field)
+cd8_base <- JoinLayers(cd8_base)   # merge() left split layers; MUST rejoin before aggregating
+
+chk <- unique(cd8_base@meta.data[, c("patient","response")])
+stopifnot(!any(duplicated(chk$patient)))   # hard guard: one label per patient
+print(table(chk$response))                 # 10 Non-responder / 9 Responder
+cat("baseline CD8 cells:", ncol(cd8_base), "\n")   # 2651
+print(table(cd8_base$patient, cd8_base$response))
+```
+
+**Minimum-cell threshold.** Per-patient CD8 yield ranges **33–257**. A ≥20-cell
+floor is declared a priori; every patient clears it, so it removes nothing. The
+thinnest patients (P6 = 33, P26 = 34, P35 = 55) are addressed by sensitivity
+analysis below rather than by exclusion.
+
+---
+
+# Result 1 — Module scores
+
+```{r modules}
+memory_like <- list(c("TCF7","IL7R","CCR7","SELL","LEF1","GZMK"))
+exhausted   <- list(c("HAVCR2","LAG3","PDCD1","TIGIT","CTLA4","ENTPD1","TOX"))
+
+cd8_base <- NormalizeData(cd8_base)
+cd8_base <- AddModuleScore(cd8_base, features = memory_like, name = "MemoryLike")
+cd8_base <- AddModuleScore(cd8_base, features = exhausted,   name = "Exhausted")
+
+## Collapse to the patient — the unit of analysis
+pt_scores <- cd8_base@meta.data |>
+  group_by(patient, response) |>
+  summarise(n_cd8 = n(),
+            mem   = mean(MemoryLike1),
+            exh   = mean(Exhausted1),
+            ratio = mem - exh,          # module scores are already centered
+            .groups = "drop")
+
+wilcox.test(mem   ~ response, data = pt_scores)   # W=17, p=0.022
+wilcox.test(exh   ~ response, data = pt_scores)   # W=71, p=0.035
+wilcox.test(ratio ~ response, data = pt_scores)   # W=11, p=0.0041  <- primary
+```
+
+| Score | W | p | Direction | NR mean | R mean |
+|---|---|---|---|---|---|
+| Memory-like | 17 | 0.022 | R higher | −0.099 | +0.156 |
+| Exhaustion | 71 | 0.035 | **NR higher** | −0.024 | −0.293 |
+| **Balance (mem − exh)** | **11** | **0.0041** | R higher | −0.075 | **+0.449** |
+
+The **balance is stronger than either component**, consistent with the original
+claim that it is the *ratio* of states, not either alone, that tracks response.
+`ratio` is the **pre-specified primary endpoint** — the three tests are not
+independent (`ratio` is derived from the other two), and it survives Bonferroni
+(0.0041 × 3 = 0.012).
+
+`W = 11` of 90 possible pairs ⇒ responders exceed non-responders in 79/90 pairs ⇒
+**univariate AUROC = 0.878**.
+
+```{r modules-plot}
+pt_long <- tidyr::pivot_longer(pt_scores, c(mem, exh, ratio),
+                               names_to = "score", values_to = "value")
+ggplot2::ggplot(pt_long, ggplot2::aes(response, value, fill = response)) +
+  ggplot2::geom_boxplot(outlier.shape = NA, alpha = .6) +
+  ggplot2::geom_jitter(width = .15, size = 2) +
+  ggplot2::facet_wrap(~score, scales = "free_y") +
+  ggplot2::theme_bw() + ggplot2::labs(x = NULL, y = "per-patient mean module score")
+```
+
+---
+
+# Result 2 — Composition (independent methodology)
+
+Module scores depend on gene-list choice. Differential abundance of
+marker-validated clusters is the more robust framing. Proportions are
+**compositional** (a fixed pie — one fraction rising forces others down), so a
+centered log-ratio transform is applied rather than naive proportion tests.
+
+```{r composition}
+cd8_base$cd8_state <- dplyr::case_when(
+  cd8_base$seurat_clusters == "2"          ~ "memlike",
+  cd8_base$seurat_clusters %in% c("1","6") ~ "exhausted",
+  cd8_base$seurat_clusters == "8"          ~ "intermediate",
+  TRUE                                     ~ "other"
+)
+print(table(cd8_base$cd8_state, cd8_base$response))
+
+comp <- cd8_base@meta.data |>
+  dplyr::count(patient, response, cd8_state) |>
+  tidyr::pivot_wider(names_from = cd8_state, values_from = n, values_fill = 0)
+
+cnt <- as.matrix(comp[, setdiff(names(comp), c("patient","response"))])
+clr <- function(x){ x <- x + 0.5; log(x) - rowMeans(log(x)) }
+comp_clr <- as.data.frame(clr(cnt)); comp_clr$response <- comp$response
+
+for (s in setdiff(colnames(comp_clr), "response"))
+  print(wilcox.test(comp_clr[[s]] ~ comp_clr$response))
+```
+
+| CD8 state | NR cells | R cells | W | p |
+|---|---|---|---|---|
+| **exhausted** | 1,063 | 447 | **79** | **0.0041** (Bonf. 4× = 0.017) |
+| memlike | 358 | 289 | 36 | 0.50 |
+| intermediate | 156 | 103 | 48 | 0.84 |
+| other | 126 | 109 | 29 | 0.21 |
+
+**⇒ 1,063/1,703 = 62% of NR CD8s are exhausted vs 447/948 = 47% of R CD8s.**
+
+## The methods disagree — and the disagreement is the finding
+
+Composition confirms **exhaustion** (p = 0.0041) but **not memory-like abundance**
+(p = 0.50), whereas module scores showed both. They measure different things:
+
+- **Composition** asks *how many cells fall in the memory-like cluster?*
+- **Module score** asks *how strongly do CD8s express the program, averaged across all of them?*
+
+Responders do not have **more** memory-like cells — they have CD8s that are **less
+exhausted overall**. Because the module score averages across every CD8, a lower
+exhausted burden mechanically lifts the mean memory-like score with no change in
+memory-like cluster size. Discrete cluster assignment is also coarse (a cell just
+over a boundary counts fully), while the continuous score captures gradations.
+
+**Conclusion: the finding is about exhaustion burden.** Both methods agree there,
+at identical p and near-identical W-magnitude.
+
+## Raw fraction (most interpretable)
+
+```{r fraction}
+frac <- cd8_base@meta.data |>
+  dplyr::count(patient, response, cd8_state) |>
+  dplyr::group_by(patient, response) |>
+  dplyr::mutate(frac = n/sum(n)) |>
+  dplyr::filter(cd8_state == "exhausted")
+
+frac |> dplyr::group_by(response) |>
+  dplyr::summarise(median_frac = median(frac), mean_frac = mean(frac))
+wilcox.test(frac ~ response, data = frac)    # W=77, p=0.0076
+pROC::roc(response ~ frac, data = frac)      # AUC = 0.8556
+```
+
+|  | median | mean |
+|---|---|---|
+| Non-responder | **0.624** | 0.606 |
+| Responder | **0.500** | 0.444 |
+
+`pROC` independently confirms direction (*controls > cases*). **AUROC = 0.856.**
+A ~16-point absolute difference in exhausted burden — a clinically legible effect,
+not a statistical curiosity.
+
+### Per-patient structure (honest overlap)
+
+- Cleanest responders: **P8 (14.8%)**, **P26 (23.5%)**
+- Cleanest non-responders: **P2 (73.4%)**, **P27 (70.0%)**, **P12 (67.5%)**
+- Overlap zone ~50–57%: P1 (55.2%), P28 (55.7%), P29 (57.1%) are responders in
+  non-responder territory; **P3 (35.3%)** is a non-responder with responder-like
+  low exhaustion.
+
+At a 55% cutoff, **~4 of 19 patients misclassify**. This is a population-level
+shift with real predictive value, **not a clean separator** — which is exactly why
+no locked blood biomarker exists for ICB response.
+
+---
+
+# Robustness
+
+```{r robustness}
+## 1. Cell-depth sensitivity — does the result survive dropping thin patients?
+pt_thick <- dplyr::filter(pt_scores, n_cd8 >= 50)      # 17 of 19 retained
+wilcox.test(ratio ~ response, data = pt_thick)          # W=10, p=0.011
+
+## 2. Is the signal an artifact of sequencing depth?
+cor.test(pt_scores$n_cd8, pt_scores$ratio, method = "spearman")
+# rho = -0.349, p = 0.143
+
+## 3. Therapy confound
+ther <- cd8_base@meta.data |> dplyr::distinct(patient, response, therapy)
+print(table(ther$therapy, ther$response))
+fisher.test(table(ther$therapy, ther$response))        # p = 0.271
+
+## 4. Largest homogeneous stratum: anti-PD1 only
+pd1 <- pt_scores |> dplyr::left_join(ther, by = c("patient","response")) |>
+  dplyr::filter(therapy == "anti-PD1")
+wilcox.test(ratio ~ response, data = pd1)              # W=7, p=0.15, n=12 (8 NR / 4 R)
+```
+
+**Depth sensitivity — passed.** Excluding P6 and P26 (n=17) preserves the effect
+(p = 0.011); the rise from 0.0041 is the power cost of two fewer patients. The
+result does not depend on P26's extreme value on 34 cells.
+
+**Depth confound — passed, conservatively.** rho = −0.35, p = 0.14. The *negative*
+sign means higher-yield patients trend toward *more* exhaustion; depth works
+slightly **against** a spurious responder signal.
+
+**Therapy — descriptively imbalanced, not statistically demonstrable.**
+
+| | NR | R |
+|---|---|---|
+| anti-CTLA4 | 1 | 1 |
+| anti-CTLA4+PD1 | 1 | 4 |
+| anti-PD1 | **8** | 4 |
+
+Fisher **p = 0.27** — therapy–response association can be neither demonstrated nor
+excluded at n = 19. Within the anti-PD1 stratum the effect is **directionally
+preserved**: W = 7 of 32 (null expectation 16), 25/32 pairs (78%) in the expected
+direction, **AUROC 0.78**, p = 0.15 at n = 12. The exact test *could* have reached
+significance here (minimum achievable p ≈ 0.004), so this is genuine underpowering
+rather than a floor effect.
+
+---
+
+# Why no multivariate classifier
+
+A single mechanistically-motivated feature already yields **AUROC 0.88**. At n = 19,
+a lasso over dozens of features will either re-select the same signal or overfit to
+a spurious improvement. **The ratio is the signature.** One interpretable biological
+feature at AUROC 0.88 is a stronger and more defensible claim than a multi-feature
+model at this sample size.
+
+Had a classifier been fit, the non-negotiable guards would be: split **by patient**
+(here automatic — each row *is* a patient), feature selection **inside** the CV loop,
+and leave-one-patient-out CV.
+
+---
+
+# Limitations
+
+1. **External validation not performed.** Signatures that shine in discovery and
+   evaporate on an independent cohort are the norm. This is the required next step
+   (GSE115978, or a bulk melanoma ICB cohort scored via a rank-based signature).
+2. **Predictive vs prognostic not established.** Without an untreated control arm,
+   it cannot be shown that exhaustion burden predicts benefit *from this drug*
+   rather than general disease severity. The drug-mechanism coherence (checkpoint
+   blockade acts on the exhaustion axis) is supporting, not dispositive.
+3. **Therapy imbalance** (above) — neither demonstrated nor excluded.
+4. **Tumor, not blood.** Not deployable for enrollment; a PBMC-based equivalent is
+   the translational path.
+5. **n = 19.** Adequate for patient-level nonparametric testing; not for locking a
+   clinical cutoff.
+6. **Metadata inconsistency** (P4/P28) — paired Pre→Post analyses not attempted.
+7. **Endpoint** is the deposit's R/NR label, not durable clinical benefit (PFS/OS).
+8. **Exhaustion module contains `CTLA4`/`TIGIT`**, which are broad; the axis holds
+   on PDCD1/HAVCR2/LAG3/TOX/ENTPD1 and is corroborated by cluster composition,
+   which is gene-list-independent.
+
+---
+
+# Mechanistic interpretation
+
+> **Responders carry a baseline CD8 compartment with a lower exhaustion burden —
+> a larger reinvigoration-competent reserve for checkpoint blockade to mobilize.
+> Non-responders arrive with CD8s already skewed toward a terminally exhausted
+> state that checkpoint blockade cannot rescue.**
+
+This is a *mechanism*, not a statistic, and that matters three ways. It is
+falsifiable and biologically coherent, so it is defensible to partners and
+regulators in a way that "our model has AUC 0.86" is not. It argues the marker is
+**predictive** (linked to the drug's mode of action) rather than merely prognostic.
+And read backwards, it converts a stratification biomarker into **target
+discovery**: whatever enforces the terminally exhausted state in non-responders
+becomes a candidate target for combination therapy — the drug-development funnel
+running in reverse.
+
+---
+
+# Reproducibility
+
+```{r sessioninfo, eval=TRUE}
+sessionInfo()
+```

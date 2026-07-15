@@ -2,6 +2,8 @@
 
 This repository showcases a comprehensive set of bioinformatics analyses and skills.
 
+**Featured:** [Baseline CD8 exhaustion burden predicts checkpoint-blockade response](docs/scrna_icb_response.md) — end-to-end reanalysis of GSE120575 from raw GEO files. AUROC 0.86 (n=19), replicated across three independent parameterizations.
+
 ## Projects
 
 1. Variant Analysis Pipeline
@@ -12,6 +14,7 @@ This repository showcases a comprehensive set of bioinformatics analyses and ski
 6. Spatial Transcriptomics Analysis
 7. Single-cell ATAC-seq Analysis (Signac/Seurat)
 8. Single-cell ATAC-seq Analysis (Scanpy/Episcanpy)
+9. ICB Response Biomarker: CD8 Exhaustion Predicts Checkpoint Blockade Response (GSE120575)
 
 ## Setup
 
@@ -36,6 +39,7 @@ Detailed documentation for each analysis can be found in the `docs` directory:
 - [Spatial Transcriptomics Analysis](docs/spatial_transcriptomics.md)
 - [Single-cell ATAC-seq Analysis (Signac)](docs/scatac_signac.md)
 - [Single-cell ATAC-seq Analysis (Scanpy)](docs/scatac_scanpy.md)
+- [ICB Response Biomarker — CD8 Exhaustion](docs/scrna_icb_response.md)
 
 
 ## Contact
