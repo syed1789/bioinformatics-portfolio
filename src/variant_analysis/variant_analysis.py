@@ -3,7 +3,18 @@ import numpy as np
 
 def load_vcf(file_path):
     """Load a VCF file into a pandas DataFrame."""
-    df = pd.read_csv(file_path, sep='\t', comment='#')
+    import gzip
+    opener = gzip.open if str(file_path).endswith(".gz") else open
+    with opener(file_path, "rt") as fh:
+        lines = [l for l in fh if not l.startswith("##")]
+    header = lines[0].lstrip("#").rstrip("\n").split("\t")
+    rows = [l.rstrip("\n").split("\t") for l in lines[1:]]
+    df = pd.DataFrame(rows, columns=header)
+    for col in ("POS",):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col])
+    if "QUAL" in df.columns:
+        df["QUAL"] = pd.to_numeric(df["QUAL"], errors="coerce")
     return df
 
 def annotate_variants(vcf_df):
